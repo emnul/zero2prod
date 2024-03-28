@@ -1,12 +1,45 @@
+use once_cell::sync::Lazy;
+use serde::de::IntoDeserializer;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use std::net::TcpListener;
+use tracing::subscriber;
 use uuid::Uuid;
 use zero2prod::configuration::{get_configuration, DatabaseSettings};
 use zero2prod::startup::run;
+use zero2prod::telemetry::{get_subscriber, init_subscriber};
+
+// Ensure that the `tracing` stack is only initialized once using `once_cell`
+static TRACING: Lazy<()> = Lazy::new(|| {
+    let subscriber = get_subscriber("test".into(), "debug".into());
+    init_subscriber(subscriber);
+});
 
 pub struct TestApp {
     pub address: String,
     pub db_pool: PgPool,
+}
+
+/// Spins up an instance of our application on random port
+/// with a new, unique logical database in the background
+/// so we can perform tests on it
+async fn spawn_app() -> TestApp {
+    // The first time `initialize` is invoked the code in `TRACING` is executed
+    // All other invocations will instead skip execution
+    Lazy::force(&TRACING);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to a random port");
+    let port = listener.local_addr().unwrap().port();
+    let address = format!("http://127.0.0.1:{}", port);
+
+    let mut configuration = get_configuration().expect("Failed to read configuration");
+    configuration.database.database_name = Uuid::new_v4().to_string();
+    let connection_pool = configure_database(&configuration.database).await;
+    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
+    let _ = tokio::spawn(server);
+
+    TestApp {
+        address,
+        db_pool: connection_pool,
+    }
 }
 
 //`tokio::test` is the testing equivalent of `tokio::main`
@@ -94,24 +127,9 @@ async fn subscribe_returns_a_400_when_data_is_missing() {
     }
 }
 
-/// Spin up an instance of our application
-async fn spawn_app() -> TestApp {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to a random port");
-    let port = listener.local_addr().unwrap().port();
-    let address = format!("http://127.0.0.1:{}", port);
-
-    let mut configuration = get_configuration().expect("Failed to read configuration");
-    configuration.database.database_name = Uuid::new_v4().to_string();
-    let connection_pool = configure_database(&configuration.database).await;
-    let server = run(listener, connection_pool.clone()).expect("Failed to bind address");
-    let _ = tokio::spawn(server);
-
-    TestApp {
-        address,
-        db_pool: connection_pool,
-    }
-}
-
+/// Connects to Postgres instance
+/// Uses connection to create a new database
+/// Runs migrations on new database
 pub async fn configure_database(config: &DatabaseSettings) -> PgPool {
     // Create database
     let mut connection = PgConnection::connect(&config.connection_string_without_db())
